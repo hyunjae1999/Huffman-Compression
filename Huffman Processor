@@ -1,0 +1,214 @@
+import java.util.PriorityQueue;
+/**
+ *	Interface that all compression suites must implement. That is they must be
+ *	able to compress a file and also reverse/decompress that process.
+ *
+ */
+public class HuffProcessor {
+	public static final int BITS_PER_WORD = 8;
+	public static final int BITS_PER_INT = 32;
+	public static final int ALPH_SIZE = (1 << BITS_PER_WORD); // or 256
+	public static final int PSEUDO_EOF = ALPH_SIZE;
+	public static final int HUFF_NUMBER = 0xface8200;
+	public static final int HUFF_TREE  = HUFF_NUMBER | 1;
+	public static final int HUFF_COUNTS = HUFF_NUMBER | 2;
+	public enum Header{TREE_HEADER, COUNT_HEADER};
+	public Header myHeader = Header.TREE_HEADER;
+	
+	/**
+	 * Compresses a file. Process must be reversible and loss-less.
+	 *
+	 * @param in
+	 *            Buffered bit stream of the file to be compressed.
+	 * @param out
+	 *            Buffered bit stream writing to the output file.
+	 */
+	public void compress(BitInputStream in, BitOutputStream out){
+		int[] counts =readForCounts(in);
+		int count = 0;
+		for(int i=0; i<counts.length; i++) {
+			if(counts[i]!=0)
+				count++;
+		}
+		System.out.println(count);
+		HuffNode root = makeTreeFromCounts(counts);
+		String[] codings = makeCodingsFromTree(root);
+		writeHeader(root, out);
+		in.reset();
+		writeCompressedBits(in, codings, out);
+	}
+	/**
+	 * Decompresses a file. Output file must be identical bit-by-bit to the
+	 * original.
+	 *
+	 * @param in
+	 *            Buffered bit stream of the file to be decompressed.
+	 * @param out
+	 *            Buffered bit stream writing to the output file.
+	 */
+	public void decompress(BitInputStream in, BitOutputStream out){
+	    int magicnumber=in.readBits(BITS_PER_INT);
+	    if(magicnumber!=HUFF_TREE)
+	    	throw new HuffException("magic number doesn't match");
+        HuffNode root=readTreeHeader(in);
+        readCompressedBits(root,in,out);
+	}
+	/*
+	 * This method reads the tree header in a given input stream. Reads the first bit and if it is a 0, indicating
+	 * an internal node, I will recursively attach two children nodes to my current node. If a bit read is 1, I will return a new 
+	 * Huffnode containing the next 9 bits read from the stream, as it is a letter.
+	 */
+	private HuffNode readTreeHeader(BitInputStream in) {
+		int val=in.readBits(1);
+		if(val==0) {
+			return new HuffNode(99, 99, readTreeHeader(in), readTreeHeader(in));
+		}
+		else 
+			return new HuffNode(in.readBits(BITS_PER_WORD+1),99);
+	}
+	/*
+	 * This traverses the given huff tree based on the read bit. Will read the input stream one bit at a time, 
+	 * and if the bit read is a 1, this method traverses to right child and if it is 0, traverses to left child. 
+	 * Once the method reaches a pseudo_eof value, will break out of while loop and stop reading. Also, will keep
+	 * writing into the output stream the value letter stored in the leaf once the method reaches a leaf node.
+	 */
+	private HuffNode readCompressedBits(HuffNode root, BitInputStream in, BitOutputStream out) {
+		HuffNode current=root;
+		while(true) {
+			int val=in.readBits(1);
+			if(val==-1) {
+				throw new HuffException("bad input, no PSEUDO_EOF");
+			}
+			else {
+				if(val==0)
+					current=current.left();
+				else if(val==1)
+					current=current.right();
+				if(current.left()==null && current.right()==null) {
+					if(current.value()==PSEUDO_EOF)
+						break;
+					else {
+						out.writeBits(BITS_PER_WORD,current.value());
+						current=root;
+					}
+				}
+			}
+		}
+		return current;
+	}
+	/*
+	 * Will read the input stream 8 bits at a time and once the value read is -1, will break. If 
+	 * the value is not -1, I will increment the index value corresponding to the read value from the stream 
+	 * by 1 each time that bit occurs. Will return integer array with each index as the bit read from the stream, and
+	 * their corresponding entries being how many times that index number occurs in the stream.
+	 */
+	private int[] readForCounts(BitInputStream in) {
+		int[] ret=new int[256];
+		while(true) {
+			int val=in.readBits(BITS_PER_WORD);
+			if(val==-1)
+				break;
+			ret[val]+=1;
+		}
+		
+		return ret;
+	}
+	/*
+	 * Given the given integer array resulting from readForCounts, will add a Huffnode for each non zero entry in the
+	 * array to a priorityqueue. The huffnode's value will be the index, while the weight will be how many times it appears.
+	 * I will also add the PSEUDO_EOF into the priority queue. I will keep removing from the priority queue and creating new huffnodes 
+	 * with the children being the removed nodes, and the weight being the weights of the children added together. I will then add this node
+	 * to the queue as well. 
+	 */
+	private HuffNode makeTreeFromCounts(int[] arr) {
+		PriorityQueue<HuffNode> pq = new PriorityQueue<>();
+		for (int i=0; i<arr.length; i++) {
+			int num=arr[i];
+			if(num!=0)
+				pq.add(new HuffNode(i, num));
+		}
+		pq.add(new HuffNode(PSEUDO_EOF,1));
+		while(pq.size()>1) {
+			HuffNode left=pq.remove();
+			HuffNode right= pq.remove();
+			HuffNode t=new HuffNode(-1,left.weight()+right.weight(), left,right);
+			pq.add(t);
+		}
+		HuffNode root = pq.remove();
+		return root;
+	}
+	
+	/*
+	 * I will keep recursively traversing the given huff tree, and if the left is not null, I will concanate a 0 to 
+	 * the input string parameter path. Also, if the right child if not null, I will concanate a 1 recursively to the input string parameter.
+	 * If the method recursively hits the base case of a leaf, I will set the huffnode's value corresponding index in the string array codings
+	 * equal to the string path as it is in that time. 
+	 */
+	private void makeCodingsFromTree(HuffNode root, String path, String[] codings) {
+		if(root.left()==null&&root.right()==null)
+			codings[root.value()]=path;
+		if(root.left()!=null)
+			makeCodingsFromTree(root.left(), path+"0", codings);
+		if(root.right()!=null)
+			makeCodingsFromTree(root.right(), path+"1", codings);
+	}
+	/*
+	 * This method actually creates the string array to be populated by the above method and returns this array.
+	 */
+	private String[] makeCodingsFromTree(HuffNode root) {
+		String[] ret = new String[257];
+		makeCodingsFromTree(root,"",ret);
+		return ret;
+	}
+	/*
+	 * This method writes into the output stream the magic number, then writes the corresponding 0 if the node visited is internal
+	 * and a 1 if the node is a leaf. 
+	 */
+	private void writeHeader(HuffNode root, BitOutputStream out) {
+		out.writeBits(BITS_PER_INT, HUFF_TREE);
+		writeTree(root,out);
+	}
+	/*
+	 * Helper method for above method, this is the method that actually writes out the pre order traversal of the given tree based on if the node
+	 * visited is a leaf or internal.
+	 */
+	private void writeTree(HuffNode root, BitOutputStream out) {
+		if(root==null)
+			return;
+		if(root.left()==null&&root.right()==null) {
+			out.writeBits(1,1);
+			out.writeBits(BITS_PER_WORD+1,root.value());
+			return;
+		}			
+		else
+		{
+			out.writeBits(1,0);
+			writeTree(root.left(),out);
+			writeTree(root.right(), out);
+		}
+	}
+	/*
+	 * Read input stream 8 bits a time. If what is read is -1, will write into the output stream pseudoeof compressed coding.
+	 * If what is read is not a -1, will write into the output stream the binary coding stored in the corresponding index of the 
+	 * previously populated codings array from makeCodingsFromTree. I use the parseInt method to convert the binary code string from
+	 * a string into an integer, as I wish to write integers into the outputstream.
+	 */
+	private void writeCompressedBits(BitInputStream in, String[] codings, BitOutputStream out) {
+		while(true) {
+			int val=in.readBits(BITS_PER_WORD);
+			if(val==-1) {
+				out.writeBits(codings[256].length(),Integer.parseInt(codings[256],2));
+				return;
+			}
+			else {
+				String myNum=codings[val];
+				out.writeBits(myNum.length(), Integer.parseInt(myNum, 2));
+			}
+		}
+		
+	}
+	public void setHeader(Header header) {
+        myHeader = header;
+        System.out.println("header set to "+myHeader);
+    }
+}
